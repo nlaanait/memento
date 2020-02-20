@@ -1,6 +1,8 @@
 import os
 from contextlib import redirect_stdout
 from spinup.utils.logx import EpochLogger
+import torch
+
 
 class VPGLogger(EpochLogger):
     """Logger for Vanilla Policy Gradient (Subclasses spinup.EpochLogger)
