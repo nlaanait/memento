@@ -340,7 +340,6 @@ def vpg_train(env_func, device=None, actor_critic=ActorCritic, ac_kwargs=dict(),
             logger.save_state({'env': env}, None)
 
         # VPG update
-        logger.log("Buffer shapes: {}".format(buf.shape))
         update(buf)
 
         # Log info about epoch
