@@ -257,7 +257,7 @@ class CompetitiveGradientJacobi(object):
         self.iter_count = 0
 
     def print_verbose(self, *args, **kwargs):
-        if self.verbose and self.rank == 0:
+        if self.verbose :
             print(*args, **kwargs)
 
     def solve(self, f, g, x, y, delay=1):
@@ -271,8 +271,8 @@ class CompetitiveGradientJacobi(object):
 
         __prev_y = y.clone().detach().requires_grad_(True)
         __prev_x = x.clone().detach().requires_grad_(True)
-        __x_history.append(x0)
-        __y_history.append(y0)
+        __x_history.append(x)
+        __y_history.append(y)
 
         while self.iter_count < self.nsteps:
 
@@ -293,9 +293,9 @@ class CompetitiveGradientJacobi(object):
                 __hess_f_xy_x = hessian_vec(__grad_f_x_x, __prev_y, retain_graph=False)
                 __hess_f_xy_y = hessian_vec(__grad_f_x_y, y, retain_graph=False)
                 __hess_g_yx_x = hessian_vec(__grad_g_y_x, x, retain_graph=False)
-                __hess_g_yx_y = hessian_vec(__grad_g_y_y, prev_x, retain_graph=False)
-                __delta_x = -lr * (__grad_f_x_x + 2 * __hess_f_xy_x * __grad_g_y_x)
-                __delta_y = -lr * (__grad_g_y_y + 2 * __hess_g_yx_y * __grad_f_x_y)
+                __hess_g_yx_y = hessian_vec(__grad_g_y_y, __prev_x, retain_graph=False)
+                __delta_x = -self.lr * (__grad_f_x_x + 2 * __hess_f_xy_x * __grad_g_y_x)
+                __delta_y = -self.lr * (__grad_g_y_y + 2 * __hess_g_yx_y * __grad_f_x_y)
             else:
 
                 __hess_f_xy_x = hessian(__grad_f_x_x, __prev_y, retain_graph=False)
