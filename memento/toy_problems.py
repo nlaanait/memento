@@ -10,7 +10,7 @@ if __name__ == "__main__":
     jacobi_plot = True
     n_dims = 1
     nsteps = 500
-    lr = 0.01
+    lr = 0.1
 
     x0 = torch.randn((n_dims,), requires_grad=True)
     y0 = torch.randn((n_dims,), requires_grad=True)
@@ -30,7 +30,7 @@ if __name__ == "__main__":
         x_gd = x0
         y_gd = y0
 
-        conjugate_gd_solver = ConjugateGradient(nsteps=nsteps, residual_tol=1e-18, lr=0.1)
+        conjugate_gd_solver = ConjugateGradient(nsteps=nsteps, residual_tol=1e-18, lr=lr)
         [f_history_gd, g_history_gd, x_history_gd, y_history_gd] = conjugate_gd_solver.solve(f, g, x_gd, y_gd)
 
     if explicit:
@@ -38,7 +38,7 @@ if __name__ == "__main__":
         x_cgd = x0
         y_cgd = y0
 
-        conjugate_gd_solver = ConjugateGradient(nsteps=nsteps, residual_tol=1e-18, lr=0.1)
+        conjugate_gd_solver = CompetitiveGradient(nsteps=nsteps, residual_tol=1e-18, lr=lr)
         [f_history_cgd, g_history_cgd, x_history_cgd, y_history_cgd] = conjugate_gd_solver.solve(f, g, x_cgd, y_cgd)
 
     if jacobi:
@@ -46,7 +46,7 @@ if __name__ == "__main__":
         x_cgd_jacobi = x0
         y_cgd_jacobi = y0
 
-        competitive_cgd_jacobi_solver = CompetitiveGradientJacobi(nsteps=nsteps, residual_tol=1e-18, lr=0.1)
+        competitive_cgd_jacobi_solver = CompetitiveGradientJacobi(nsteps=nsteps, residual_tol=1e-18, lr=lr)
         [f_history_cgd_jacobi, g_history_cgd_jacobi, x_history_cgd_jacobi, y_history_cgd_jacobi] = competitive_cgd_jacobi_solver.solve(f, g, x_cgd_jacobi, y_cgd_jacobi)
 
     if standard_gd and standard_gd_plot:
