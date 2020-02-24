@@ -33,6 +33,42 @@ class MLP(nn.Module):
         return x
 
 
+class ConvNet(nn.Module):
+    """Multi-layer Convolutional net 
+    """
+
+    def __init__(self, obs_dim, act_dim, activation=nn.ReLU):
+        """[summary]
+        
+        Arguments:
+            obs_dim {[type]} -- [description]
+            act_dim {[type]} -- [description]
+        
+        Keyword Arguments:
+            activation {[type]} -- [description] (default: {nn.ReLU})
+        """
+        super(ConvNet, self).__init__()
+        self.conv1 = nn.Conv2d(obs_dim[0], 64, 3, stride=1, padding=3//2, bias=False)
+        self.bn1 = nn.BatchNorm2d(self.conv1.out_channels)
+        self.pool1 = nn.MaxPool2d(2, stride=2)
+        self.conv2 = nn.Conv2d(64, 64, 3, stride=1, padding=3//2, bias=False)
+        self.bn2 = nn.BatchNorm2d(self.conv2.out_channels)
+        self.pool2 = nn.MaxPool2d(2, stride=2)
+        self.out_reshape = self.conv2.out_channels * (obs_dim[1] // 4) * (obs_dim[2] // 4)
+        self.fc1 = nn.Linear(self.out_reshape, 256)
+        self.fc2 = nn.Linear(256, act_dim)
+        self.activate = activation()
+
+    def forward(self, x):
+        if x.dim() < 4:
+            x = x.unsqueeze(0)
+        x = self.pool1(self.activate(self.bn1(self.conv1(x))))
+        x = self.pool2(self.activate(self.bn2(self.conv2(x))))
+        x = x.view(-1, self.out_reshape)
+        x = self.activate(self.fc1(x))
+        x = self.activate(self.fc2(x))
+        return x
+
 class Actor(nn.Module):  
     """Base Actor Class
     """
@@ -83,20 +119,33 @@ class ActorCritic(nn.Module):
     """Actor Critic Class, acts as a container for an actor and critic
     """
 
-    def __init__(self, obs_dim, act_dim, actor_type, pi_net=None, v_net=None):
+    def __init__(self, obs_shape, act_shape, actor_type, pi_net=None, v_net=None):
         super(ActorCritic, self).__init__()
 
         # policy function
-        self.pi_net = pi_net if pi_net else MLP(obs_dim, act_dim, 
-                                                activation=nn.ReLU)
+        if pi_net is None:
+            if len(obs_shape) == 3 :
+                self.pi_net = ConvNet(obs_shape, act_shape, activation=nn.ReLU)
+            elif len(obs_shape) == 1:
+                obs_dim = obs_shape[0]
+                self.pi_net = MLP(obs_dim, act_shape, activation=nn.ReLU)
+            else:
+                raise NotImplementedError("Observations shape with dimension %d is not supported" % len(obs_shape))
+
+        # value function
+        if v_net is None:
+            if len(obs_shape) == 3 :
+                self.v_net = ConvNet(obs_shape, 1, activation=nn.ReLU)
+            elif len(obs_shape) == 1:
+                obs_dim = obs_shape[0]
+                self.v_net = v_net if v_net else MLP(obs_dim, 1, activation=nn.Tanh)
+
+        self.critic = Critic(v_net=self.v_net) 
+
         if actor_type == 'categorical':
             self.actor = CategoricalActor(self.pi_net)
         else:
             raise NotImplementedError
-
-        # value function
-        self.v_net = v_net if v_net else MLP(obs_dim, 1, activation=nn.Tanh)
-        self.critic = Critic(v_net=self.v_net)
 
     def forward(self, obs):
         with torch.no_grad():

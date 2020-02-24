@@ -1,14 +1,15 @@
+import os
 import time
 from collections import namedtuple
 
+import gym
+import numpy as np
 import torch
 from gym.spaces import Box, Discrete
 from torch.optim import Adam
 
 from .agents import ActorCritic
 from .logging import VPGLogger
-import gym
-import os
 
 """
 Heavily follows AND freely borrows from openai's spinningup
@@ -58,7 +59,9 @@ class VPGBuffer:
     """
     def __init__(self, obs_dim, act_dim, capacity, gamma=0.99, lam=0.95,
                  device=None, norm_advantage=True):
-        obs_shape = (capacity,) + (obs_dim,)
+        if not isinstance(obs_dim, tuple):
+            obs_dim = (obs_dim, ) 
+        obs_shape = (capacity,) + obs_dim
         act_shape = (capacity,)
         if isinstance(act_dim, tuple):
             act_shape += act_dim
@@ -85,6 +88,17 @@ class VPGBuffer:
             buffer_shape[key] = tuple(val.shape)
         return buffer_shape
 
+    @property
+    def device(self):
+        return self.dev
+
+    @device.setter
+    def device(self, dev):
+        if isinstance(dev, torch.device):
+            self.dev = dev
+        else:
+            self.dev = torch.device(dev)
+
     def __getitem__(self, item):
         self.idx = self.start_idx = 0
         if item == "advantage":
@@ -96,20 +110,20 @@ class VPGBuffer:
         return self.buffer[item].to(self.dev)
 
     def push(self, transition):
-        assert self.idx < self.capacity, "Buffer is full"
-        self.buffer["observation"][self.idx] = transition.observation.cpu()
-        self.buffer["action"][self.idx] = transition.action.cpu()
-        self.buffer["reward"][self.idx] = transition.reward
-        self.buffer["value"][self.idx] = transition.value.cpu()
-        self.buffer["logProb"][self.idx] = transition.logProb.cpu()
-        self.idx += 1
+        if self.idx < self.capacity: # only store if buffer is not full 
+            self.buffer["observation"][self.idx] = transition.observation.cpu()
+            self.buffer["action"][self.idx] = transition.action.cpu()
+            self.buffer["reward"][self.idx] = transition.reward
+            self.buffer["value"][self.idx] = transition.value.cpu()
+            self.buffer["logProb"][self.idx] = transition.logProb.cpu()
+            self.idx += 1
 
     def finish(self, last_val=0):
         path_slice = slice(self.start_idx, self.idx)
         rewards = torch.cat((self.buffer["reward"][path_slice],
-                             last_val.unsqueeze(0).cpu()), dim=0)
+                             last_val.cpu()), dim=0)
         vals = torch.cat((self.buffer["value"][path_slice],
-                          last_val.unsqueeze(0).cpu()), dim=0)
+                          last_val.cpu()), dim=0)
 
         # GAE-Lambda calculation
         self.buffer["advantage"][path_slice] = GAE_Lambda(rewards, vals,
@@ -121,11 +135,45 @@ class VPGBuffer:
 
         self.start_idx = self.idx
 
+def adjust_obs(obs, device=None, crop=[slice(40, None), slice(None, None)]):
+    if len(obs.shape) > 1:
+        obs = obs.transpose(2,0,1)
+        obs = obs[:,crop[0], crop[1]]
+        pad_y = (obs.shape[1] % 4) 
+        pad_x = (obs.shape[2] % 4)
+        obs = np.pad(obs, ((0,0),(0,pad_y), (0, pad_x)))
+        obs = np.ascontiguousarray(obs, dtype=np.float32) / 255
+    if device is not None:
+        obs = torch.as_tensor(obs, dtype=torch.float32).to(device)
+    return obs
+    
+
+def get_obs_act_dims(env):
+    obs_shape = env.observation_space.shape
+    if len(obs_shape) > 1:
+        obs = env.reset()
+        obs = adjust_obs(obs)
+        obs_shape = obs.shape
+    else:
+        obs_shape = obs_shape[0]
+    act_shape = env.action_space.n
+    return obs_shape, act_shape
+
+def get_buffer_chunks(buffer_size, chunk_size):
+    chunks = []
+    num_chunks = buffer_size // chunk_size
+    for itm in range(num_chunks):
+        if itm == num_chunks - 1:
+            partition = slice(itm * chunk_size, None)
+        else:
+            partition = slice(itm * chunk_size, (itm + 1) * chunk_size)
+        chunks.append(partition)
+    return chunks
 
 def vpg_train(env_func, device=None, actor_critic=ActorCritic, ac_kwargs=dict(), 
               buf_kwargs=dict(), steps_per_epoch=4000, epochs=50, pi_lr=3e-4,
               vf_lr=1e-3, train_v_iters=80, max_ep_len=1000,
-              logger_kwargs=dict(), save_freq=10):
+              logger_kwargs=dict(), save_freq=10, batch_size=256):
     """
     Vanilla Policy Gradient 
 
@@ -217,88 +265,109 @@ def vpg_train(env_func, device=None, actor_critic=ActorCritic, ac_kwargs=dict(),
 
     # instantiate env
     env = env_func()
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.n
+    obs_shape, act_shape = get_obs_act_dims(env)
 
     # Set up logger and save configuration
     logger = VPGLogger(**logger_kwargs)
     logger.save_config(locals())
     logger.log("Environment dimensions: observation={}, action={}"
-               .format(obs_dim, act_dim))
+               .format(obs_shape, act_shape))
 
     # istantiate actor-critic
-    actor_type = None
-    if isinstance(env.action_space, Discrete):
-        actor_type = 'categorical'
-    elif isinstance(env.action_space, Box):
-        raise NotImplementedError
-    
-    ac = actor_critic(obs_dim, act_dim, actor_type, **ac_kwargs)
-    ac = ac.to(device)
+    if actor_critic is None:
+        actor_type = None
+        if isinstance(env.action_space, Discrete):
+            actor_type = 'categorical'
+        elif isinstance(env.action_space, Box):
+            raise NotImplementedError
+        ac = actor_critic(obs_shape, act_shape, actor_type, **ac_kwargs)
+    else:
+        ac = actor_critic
+        ac = ac.to(device)
     
     # save models
     logger.setup_pytorch_saver(ac)
 
     # setup buffer
-    buf = VPGBuffer(obs_dim, act_dim, steps_per_epoch, device=device,
+    try:
+        capacity = buf_kwargs.pop('capacity')
+    except KeyError:
+        capacity = steps_per_epoch
+    buf = VPGBuffer(obs_shape, act_shape, capacity, device=device,
                     **buf_kwargs)
     logger.log("Buffer shapes: {}".format(buf.shape))
 
     # functions to compute policy and value losses
 
-    def compute_loss_pi(buf):
-        # actor (policy)
-        obs, act, adv, logp_old = [buf[itm] for itm in ['observation',
-                                                        'action',
-                                                        'advantage',
-                                                        'logProb']]
+    def compute_loss_pi(obs, act, adv, logp_old):
         pi, logp = ac.actor(obs, act)
-        loss_pi = -(logp * adv).mean()
-
+        loss_pi = -(logp * adv).mean() 
         kl = (logp_old - logp).mean()
         ent = pi.entropy().mean()
         pi_info = dict(kl=kl, ent=ent)
         return loss_pi, pi_info
 
-    def compute_loss_v(buf):
+    def compute_loss_v(obs, ret):
         # critic (value)
-        obs, ret = buf['observation'], buf['reward']
-        loss_val = ((ac.critic(obs) - ret) ** 2).mean()
+        pred_ret = ac.critic(obs)
+        loss_val = ((pred_ret - ret) ** 2).mean()
         return loss_val
 
     # optimizers
     actor_optim = Adam(ac.actor.parameters(), lr=pi_lr)
     critic_optim = Adam(ac.critic.parameters(), lr=vf_lr)
 
-    def update(buf):
-        pi_l_last, pi_info_last = compute_loss_pi(buf)
-        v_l_last = compute_loss_v(buf)
+    def update(buf, batch=64, pi_l_last=0, v_l_last=0):
+        # do updates in batches
+        buf_parts =  get_buffer_chunks(buf.idx, batch)
+        buf.device = "cpu"
+        loss_pi_val = loss_v_val = 0
+        for part in buf_parts:
+            obs, act, adv, logp_old, ret = [buf[itm][part] for itm in ["observation",
+                                                                       "action",
+                                                                       "advantage",
+                                                                       "logProb",
+                                                                       "reward"]]
+            obs = obs.to(device)
+            act = act.to(device)
+            adv = adv.to(device)
+            logp_old = logp_old.to(device)
+            ret = ret.to(device)
         
-        # single step of policy gradient descent
-        actor_optim.zero_grad()
-        loss_pi, pi_info = compute_loss_pi(buf)
-        loss_pi.backward()
-        actor_optim.step()
+            # single step of policy gradient descent
+            actor_optim.zero_grad()
+            loss_pi, pi_info = compute_loss_pi(obs, act, adv, logp_old)
+            loss_pi.backward()
+            actor_optim.step()
 
-        # value function training
-        for _ in range(train_v_iters):
-            critic_optim.zero_grad()
-            loss_v = compute_loss_v(buf)
-            loss_v.backward()
-            critic_optim.step()
+            # value function training
+            for _ in range(train_v_iters):
+                critic_optim.zero_grad()
+                loss_v = compute_loss_v(obs, ret)
+                loss_v.backward()
+                critic_optim.step()
+            
+        
+            loss_pi_val += loss_pi.item()
+            loss_v_val += loss_v.item()
+
 
         # log changes from update
-        kl, ent = pi_info['kl'], pi_info_last['ent']
+        kl, ent = pi_info['kl'], pi_info['ent']
         logger.store(LossPi=pi_l_last, LossV=v_l_last,
                      KL=kl, Entropy=ent,
-                     DeltaLossPi=(loss_pi.item() - pi_l_last),
-                     DeltaLossV=(loss_v.item() - v_l_last))
+                     DeltaLossPi=(loss_pi_val - pi_l_last),
+                     DeltaLossV=(loss_v_val - v_l_last))
+        buf.device = device
+        return loss_pi_val, loss_v_val
 
     # prepare environement
     start_time = time.time()
     obs, ep_ret, ep_len = env.reset(), 0, 0
-    obs = torch.as_tensor(obs, dtype=torch.float32).to(device)
+    obs = adjust_obs(obs, device)
 
+    pi_l_last = 0
+    v_l_last = 0
     # collect experience and update
     for epoch in range(epochs):
         for step in range(steps_per_epoch):
@@ -315,7 +384,7 @@ def vpg_train(env_func, device=None, actor_critic=ActorCritic, ac_kwargs=dict(),
             logger.store(VVals=v)
 
             # update obs
-            obs = torch.as_tensor(next_obs, dtype=torch.float32).to(device)
+            obs = adjust_obs(next_obs, device) 
 
             timeout = ep_len == max_ep_len
             episode_ended = done or timeout
@@ -324,7 +393,7 @@ def vpg_train(env_func, device=None, actor_critic=ActorCritic, ac_kwargs=dict(),
             if episode_ended or epoch_ended:
                 if epoch_ended and not(episode_ended):
                     logger.log('Warning: trajectory cut off by epoch at %d steps.'
-                          % ep_len, flush=True)
+                          % ep_len)
                 if episode_ended or epoch_ended:
                     _, v, _ = ac(obs)
                 else:
@@ -333,14 +402,14 @@ def vpg_train(env_func, device=None, actor_critic=ActorCritic, ac_kwargs=dict(),
                 if episode_ended:
                     logger.store(EpRet=ep_ret, EpLen=ep_len)
                 obs, ep_ret, ep_len = env.reset(), 0 , 0
-                obs = torch.as_tensor(obs, dtype=torch.float32).to(device)
+                obs = adjust_obs(obs, device)
         
         # Save model
         if (epoch % save_freq == 0) or (epoch == epochs-1):
             logger.save_state({'env': env}, None)
 
         # VPG update
-        update(buf)
+        pi_l_last, v_l_last = update(buf, batch=batch_size, pi_l_last=pi_l_last, v_l_last=v_l_last)
 
         # Log info about epoch
         logger.log_tabular('Epoch', epoch)
@@ -378,4 +447,3 @@ if __name__ == "__main__":
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     logger_kwargs = dict(output_dir=os.path.join('/tmp',env_args+"_vpg"))
     vpg_train(env_func, device=device, logger_kwargs=logger_kwargs, epochs=250)
-
