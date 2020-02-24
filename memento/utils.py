@@ -38,7 +38,7 @@ def discounted_cumsum(rewards, discount):
     return disc_cumsum
 
 
-def GAE_Lambda(rewards, values, discount):
+def GAE_Lambda(rewards, values, discount, lam):
     """General Advantage Estimation
     
     Arguments:
@@ -50,7 +50,7 @@ def GAE_Lambda(rewards, values, discount):
         [type] -- [description]
     """
     deltas = rewards[:-1] + discount * values[1:] - values[:-1]
-    adv = discounted_cumsum(deltas, discount)
+    adv = discounted_cumsum(deltas, discount * lam)
     return adv
 
 
@@ -119,6 +119,8 @@ class VPGBuffer:
             self.idx += 1
 
     def finish(self, last_val=0):
+        if last_val.dim() == 0:
+            last_val = last_val.unsqueeze(0)
         path_slice = slice(self.start_idx, self.idx)
         rewards = torch.cat((self.buffer["reward"][path_slice],
                              last_val.cpu()), dim=0)
@@ -127,13 +129,14 @@ class VPGBuffer:
 
         # GAE-Lambda calculation
         self.buffer["advantage"][path_slice] = GAE_Lambda(rewards, vals,
-                                                         self.gamma * self.Lambda)
+                                                         self.gamma, self.Lambda)
 
         # rewards-to-go
         self.buffer["reward"][path_slice] = discounted_cumsum(rewards,
                                                            self.gamma)[:-1]
 
         self.start_idx = self.idx
+
 
 def adjust_obs(obs, device=None, crop=[slice(40, None), slice(None, None)]):
     if len(obs.shape) > 1:
@@ -154,10 +157,9 @@ def get_obs_act_dims(env):
         obs = env.reset()
         obs = adjust_obs(obs)
         obs_shape = obs.shape
-    else:
-        obs_shape = obs_shape[0]
     act_shape = env.action_space.n
     return obs_shape, act_shape
+
 
 def get_buffer_chunks(buffer_size, chunk_size):
     chunks = []
@@ -170,9 +172,10 @@ def get_buffer_chunks(buffer_size, chunk_size):
         chunks.append(partition)
     return chunks
 
+
 def vpg_train(env_func, device=None, actor_critic=ActorCritic, ac_kwargs=dict(), 
               buf_kwargs=dict(), steps_per_epoch=4000, epochs=50, pi_lr=3e-4,
-              vf_lr=1e-3, train_v_iters=80, max_ep_len=1000,
+              vf_lr=1e-3, train_v_iters=80, max_ep_len=1000, render=False,
               logger_kwargs=dict(), save_freq=10, batch_size=256):
     """
     Vanilla Policy Gradient 
@@ -302,8 +305,8 @@ def vpg_train(env_func, device=None, actor_critic=ActorCritic, ac_kwargs=dict(),
     def compute_loss_pi(obs, act, adv, logp_old):
         pi, logp = ac.actor(obs, act)
         loss_pi = -(logp * adv).mean() 
-        kl = (logp_old - logp).mean()
-        ent = pi.entropy().mean()
+        kl = (logp_old - logp).mean().item()
+        ent = pi.entropy().mean().item()
         pi_info = dict(kl=kl, ent=ent)
         return loss_pi, pi_info
 
@@ -319,8 +322,11 @@ def vpg_train(env_func, device=None, actor_critic=ActorCritic, ac_kwargs=dict(),
 
     def update(buf, batch=64, pi_l_last=0, v_l_last=0):
         # do updates in batches
-        buf_parts =  get_buffer_chunks(buf.idx, batch)
-        buf.device = "cpu"
+        if batch is not None:
+            buf_parts =  get_buffer_chunks(buf.idx, batch)
+            buf.device = "cpu"
+        else:
+            buf_parts = [slice(None, None)]
         loss_pi_val = loss_v_val = 0
         for part in buf_parts:
             obs, act, adv, logp_old, ret = [buf[itm][part] for itm in ["observation",
@@ -354,7 +360,7 @@ def vpg_train(env_func, device=None, actor_critic=ActorCritic, ac_kwargs=dict(),
 
         # log changes from update
         kl, ent = pi_info['kl'], pi_info['ent']
-        logger.store(LossPi=pi_l_last, LossV=v_l_last,
+        logger.store(LossPi=loss_pi_val, LossV=loss_v_val,
                      KL=kl, Entropy=ent,
                      DeltaLossPi=(loss_pi_val - pi_l_last),
                      DeltaLossV=(loss_v_val - v_l_last))
@@ -368,10 +374,14 @@ def vpg_train(env_func, device=None, actor_critic=ActorCritic, ac_kwargs=dict(),
 
     pi_l_last = 0
     v_l_last = 0
+    last_obs = torch.zeros_like(obs)
     # collect experience and update
     for epoch in range(epochs):
+        env.reset()
         for step in range(steps_per_epoch):
-            a, v, logp = ac(obs)
+            if render:
+                env.render()
+            a, v, logp = ac(obs - last_obs)
             next_obs, reward, done, _ = env.step(a.cpu().numpy())
             ep_ret += reward
             ep_len += 1
@@ -383,7 +393,9 @@ def vpg_train(env_func, device=None, actor_critic=ActorCritic, ac_kwargs=dict(),
             buf.push(transition)
             logger.store(VVals=v)
 
+            
             # update obs
+            last_obs = obs
             obs = adjust_obs(next_obs, device) 
 
             timeout = ep_len == max_ep_len
@@ -394,7 +406,7 @@ def vpg_train(env_func, device=None, actor_critic=ActorCritic, ac_kwargs=dict(),
                 if epoch_ended and not(episode_ended):
                     logger.log('Warning: trajectory cut off by epoch at %d steps.'
                           % ep_len)
-                if episode_ended or epoch_ended:
+                if timeout or epoch_ended:
                     _, v, _ = ac(obs)
                 else:
                     v = 0

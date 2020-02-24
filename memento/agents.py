@@ -48,13 +48,14 @@ class ConvNet(nn.Module):
             activation {[type]} -- [description] (default: {nn.ReLU})
         """
         super(ConvNet, self).__init__()
-        self.conv1 = nn.Conv2d(obs_dim[0], 64, 3, stride=1, padding=3//2, bias=False)
+        self.conv1 = nn.Conv2d(obs_dim[0], 16, 8, stride=2, padding=8//2, bias=False)
         self.bn1 = nn.BatchNorm2d(self.conv1.out_channels)
         self.pool1 = nn.MaxPool2d(2, stride=2)
-        self.conv2 = nn.Conv2d(64, 64, 3, stride=1, padding=3//2, bias=False)
+        self.conv2 = nn.Conv2d(16, 16, 4, stride=2, padding=4//2, bias=False)
         self.bn2 = nn.BatchNorm2d(self.conv2.out_channels)
         self.pool2 = nn.MaxPool2d(2, stride=2)
         self.out_reshape = self.conv2.out_channels * (obs_dim[1] // 4) * (obs_dim[2] // 4)
+        # self.out_reshape = 1760
         self.fc1 = nn.Linear(self.out_reshape, 256)
         self.fc2 = nn.Linear(256, act_dim)
         self.activate = activation()
@@ -121,7 +122,8 @@ class ActorCritic(nn.Module):
 
     def __init__(self, obs_shape, act_shape, actor_type, pi_net=None, v_net=None):
         super(ActorCritic, self).__init__()
-
+        self.pi_net = pi_net
+        self.v_net = v_net
         # policy function
         if pi_net is None:
             if len(obs_shape) == 3 :
