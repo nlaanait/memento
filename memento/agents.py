@@ -48,23 +48,34 @@ class ConvNet(nn.Module):
             activation {[type]} -- [description] (default: {nn.ReLU})
         """
         super(ConvNet, self).__init__()
-        self.conv1 = nn.Conv2d(obs_dim[0], 16, 8, stride=2, padding=8//2, bias=False)
+        kernel = [4,4]
+        stride = [2,2]
+        dilation = [1,1]
+        padding = [kernel[0]//2, kernel[1]//2]
+        self.conv1 = nn.Conv2d(obs_dim[0], 16, kernel, stride=stride, padding=padding, 
+                               dilation=dilation,bias=False)
+        out_shape_1 = self._get_output_shape(obs_dim[1:], kernel, padding, stride, dilation)
         self.bn1 = nn.BatchNorm2d(self.conv1.out_channels)
-        self.pool1 = nn.MaxPool2d(2, stride=2)
-        self.conv2 = nn.Conv2d(16, 16, 4, stride=2, padding=4//2, bias=False)
+        self.conv2 = nn.Conv2d(self.conv1.out_channels, 32, kernel, stride=stride, padding=padding,
+                               dilation=dilation, bias=False)
+        out_shape_2 = self._get_output_shape(out_shape_1, kernel, padding, stride, dilation) 
         self.bn2 = nn.BatchNorm2d(self.conv2.out_channels)
-        self.pool2 = nn.MaxPool2d(2, stride=2)
-        self.out_reshape = self.conv2.out_channels * (obs_dim[1] // 4) * (obs_dim[2] // 4)
-        # self.out_reshape = 1760
+        self.out_reshape = self.conv2.out_channels * out_shape_2[0] * out_shape_2[1] 
         self.fc1 = nn.Linear(self.out_reshape, 256)
         self.fc2 = nn.Linear(256, act_dim)
         self.activate = activation()
 
+    @staticmethod
+    def _get_output_shape(input_dim, kernel, padding, stride, dilation):
+        out_dim_H = (input_dim[0] + 2 * padding[0] - dilation[0] * (kernel[0] - 1) - 1) // stride[0] + 1
+        out_dim_W = (input_dim[1] + 2 * padding[1] - dilation[1] * (kernel[1] - 1) - 1) // stride[1] + 1
+        return out_dim_H, out_dim_W
+
     def forward(self, x):
         if x.dim() < 4:
             x = x.unsqueeze(0)
-        x = self.pool1(self.activate(self.bn1(self.conv1(x))))
-        x = self.pool2(self.activate(self.bn2(self.conv2(x))))
+        x = self.activate(self.bn1(self.conv1(x)))
+        x = self.activate(self.bn2(self.conv2(x)))
         x = x.view(-1, self.out_reshape)
         x = self.activate(self.fc1(x))
         x = self.activate(self.fc2(x))

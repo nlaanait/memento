@@ -4,6 +4,7 @@ from collections import namedtuple
 
 import gym
 import numpy as np
+import scipy
 import torch
 from gym.spaces import Box, Discrete
 from torch.optim import Adam
@@ -36,6 +37,24 @@ def discounted_cumsum(rewards, discount):
     discount **= torch.arange(0, rewards.shape[0])
     disc_cumsum = torch.cumsum(discount * rewards, 0).flip(0)
     return disc_cumsum
+
+def discount_cumsum(x, discount):
+    """
+    magic from rllab for computing discounted cumulative sums of vectors.
+
+    input: 
+        vector x, 
+        [x0, 
+         x1, 
+         x2]
+
+    output:
+        [x0 + discount * x1 + discount^2 * x2,  
+         x1 + discount * x2,
+         x2]
+    """
+    x = x.numpy()
+    return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
 
 
 def GAE_Lambda(rewards, values, discount, lam):
@@ -100,7 +119,7 @@ class VPGBuffer:
             self.dev = torch.device(dev)
 
     def __getitem__(self, item):
-        self.idx = self.start_idx = 0
+        self.idx , self.start_idx = 0 , 0
         if item == "advantage":
             if self.norm_adv:
                 adv_mean, adv_std = torch.std_mean(self.buffer["advantage"])
@@ -122,18 +141,31 @@ class VPGBuffer:
         if last_val.dim() == 0:
             last_val = last_val.unsqueeze(0)
         path_slice = slice(self.start_idx, self.idx)
+        # path_slice_adv = slice(self.start_idx, self.idx-1)
         rewards = torch.cat((self.buffer["reward"][path_slice],
                              last_val.cpu()), dim=0)
         vals = torch.cat((self.buffer["value"][path_slice],
                           last_val.cpu()), dim=0)
 
         # GAE-Lambda calculation
-        self.buffer["advantage"][path_slice] = GAE_Lambda(rewards, vals,
-                                                         self.gamma, self.Lambda)
-
+        deltas = rewards[:-1] + self.gamma * vals[1:] - vals[:-1]
+        print(deltas.shape, path_slice, self.buffer['advantage'][path_slice].shape)
+        if self.buffer['advantage'][path_slice].shape != deltas.shape:
+            path_slice_adv = slice(path_slice.start, path_slice.stop - 1)
+        else:
+            path_slice_adv = path_slice
+        if self.buffer["advantage"][path_slice_adv].size()[0] < 2:
+            self.start_idx = self.idx
+            return
+        # print('deltas shape', deltas.shape, 'advantage shape', self.buffer["advantage"][path_slice].shape)
+        # self.buffer["advantage"][path_slice_adv] = GAE_Lambda(rewards, vals,
+        #                                                  self.gamma, self.Lambda)
+        self.buffer["advantage"][path_slice_adv] = torch.from_numpy(np.ascontiguousarray(
+                                                                discount_cumsum(deltas, self.gamma * self.Lambda)))
         # rewards-to-go
-        self.buffer["reward"][path_slice] = discounted_cumsum(rewards,
-                                                           self.gamma)[:-1]
+        self.buffer["reward"][path_slice_adv] = torch.from_numpy(np.ascontiguousarray(discount_cumsum(rewards,
+                                                           self.gamma)[:-1]))
+        # self.buffer["reward"][path_slice_adv] = discounted_cumsum(rewards, self.gamma)[:-1]
 
         self.start_idx = self.idx
 
@@ -151,7 +183,16 @@ def adjust_obs(obs, device=None, crop=[slice(40, None), slice(None, None)]):
     return obs
     
 
-def get_obs_act_dims(env):
+def adjust_obs_atari(obs, device=None):
+    obs_arr = np.array(obs)
+    obs_arr = np.ascontiguousarray(obs_arr.transpose(2,0,1), dtype=np.float32) / 255
+    if device is not None:
+        obs = torch.from_numpy(obs_arr).to(device)
+        return obs
+    return obs_arr
+
+
+def get_obs_act_dims(env, adjust_obs=adjust_obs):
     obs_shape = env.observation_space.shape
     if len(obs_shape) > 1:
         obs = env.reset()
@@ -174,8 +215,8 @@ def get_buffer_chunks(buffer_size, chunk_size):
 
 
 def vpg_train(env_func, device=None, actor_critic=ActorCritic, ac_kwargs=dict(), 
-              buf_kwargs=dict(), steps_per_epoch=4000, epochs=50, pi_lr=3e-4,
-              vf_lr=1e-3, train_v_iters=80, max_ep_len=1000, render=False,
+              adjust_obs=adjust_obs, buf_kwargs=dict(), steps_per_epoch=4000, epochs=50, 
+              pi_lr=3e-4, vf_lr=1e-3, train_v_iters=80, max_ep_len=1000, render=False,
               logger_kwargs=dict(), save_freq=10, batch_size=256):
     """
     Vanilla Policy Gradient 
@@ -268,7 +309,7 @@ def vpg_train(env_func, device=None, actor_critic=ActorCritic, ac_kwargs=dict(),
 
     # instantiate env
     env = env_func()
-    obs_shape, act_shape = get_obs_act_dims(env)
+    obs_shape, act_shape = get_obs_act_dims(env, adjust_obs=adjust_obs)
 
     # Set up logger and save configuration
     logger = VPGLogger(**logger_kwargs)
@@ -395,23 +436,24 @@ def vpg_train(env_func, device=None, actor_critic=ActorCritic, ac_kwargs=dict(),
 
             
             # update obs
-            last_obs = obs
+            # last_obs = obs
             obs = adjust_obs(next_obs, device) 
 
             timeout = ep_len == max_ep_len
-            episode_ended = done or timeout
+            terminal = done or timeout
             epoch_ended = step == steps_per_epoch - 1
 
-            if episode_ended or epoch_ended:
-                if epoch_ended and not(episode_ended):
+            if terminal or epoch_ended:
+                if epoch_ended and not(terminal):
                     logger.log('Warning: trajectory cut off by epoch at %d steps.'
                           % ep_len)
                 if timeout or epoch_ended:
+                    print('timed out or epoch ended')
                     _, v, _ = ac(obs)
                 else:
-                    v = 0
+                    v = torch.Tensor(0)
                 buf.finish(v)
-                if episode_ended:
+                if terminal:
                     logger.store(EpRet=ep_ret, EpLen=ep_len)
                 obs, ep_ret, ep_len = env.reset(), 0 , 0
                 obs = adjust_obs(obs, device)
